@@ -62,6 +62,18 @@ class DB:
 
         CREATE INDEX IF NOT EXISTS idx_positions_status
         ON positions(status);
+
+        CREATE TABLE IF NOT EXISTS indicators_snapshot (
+          id BIGSERIAL PRIMARY KEY,
+          symbol TEXT NOT NULL,
+          interval TEXT NOT NULL,
+          close_time BIGINT NOT NULL,
+          payload_json JSONB NOT NULL,
+          created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        );
+
+        CREATE UNIQUE INDEX IF NOT EXISTS uq_indicators_snapshot_symbol_interval_close
+        ON indicators_snapshot(symbol, interval, close_time);
         """
         with self._conn() as conn, conn.cursor() as cur:
             cur.execute(ddl)
@@ -109,4 +121,34 @@ class DB:
         with self._conn() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute(sql)
             return list(cur.fetchall())
+        
+    def get_indicators_snapshot(self, *, symbol: str, interval: str, close_time: int) -> Dict[str, Any] | None:
+        sql = """
+        SELECT payload_json
+          FROM indicators_snapshot
+         WHERE symbol=%s AND interval=%s AND close_time=%s
+         LIMIT 1
+        """
+        with self._conn() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(sql, (symbol, interval, close_time))
+            row = cur.fetchone()
+            if not row:
+                return None
+            return row["payload_json"]
+
+    def insert_indicators_snapshot(
+        self,
+        *,
+        symbol: str,
+        interval: str,
+        close_time: int,
+        payload_json: Dict[str, Any],
+    ) -> None:
+        sql = """
+        INSERT INTO indicators_snapshot(symbol, interval, close_time, payload_json)
+        VALUES (%s, %s, %s, %s::jsonb)
+        ON CONFLICT (symbol, interval, close_time) DO NOTHING
+        """
+        with self._conn() as conn, conn.cursor() as cur:
+            cur.execute(sql, (symbol, interval, close_time, json.dumps(payload_json)))
 
