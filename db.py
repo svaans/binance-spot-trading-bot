@@ -80,6 +80,25 @@ class DB:
           calls_count INTEGER NOT NULL DEFAULT 0,
           updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
         );
+
+        CREATE TABLE IF NOT EXISTS strategy_signals (
+          id BIGSERIAL PRIMARY KEY,
+          symbol TEXT NOT NULL,
+          interval TEXT NOT NULL,
+          close_time BIGINT NOT NULL,
+          strategy_name TEXT NOT NULL,
+          strategy_type TEXT NOT NULL,
+          active BOOLEAN NOT NULL,
+          score DOUBLE PRECISION NOT NULL DEFAULT 0,
+          message TEXT NOT NULL DEFAULT '',
+          created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_strategy_signals_symbol_time
+        ON strategy_signals(symbol, close_time DESC);
+
+        CREATE INDEX IF NOT EXISTS idx_strategy_signals_active
+        ON strategy_signals(active);
         """
         with self._conn() as conn, conn.cursor() as cur:
             cur.execute(ddl)
@@ -177,4 +196,44 @@ class DB:
             if not row:
                 return 0
             return int(row[0])
+        
+    def log_strategy_signal(
+        self,
+        *,
+        symbol: str,
+        interval: str,
+        close_time: int,
+        strategy_name: str,
+        strategy_type: str,
+        active: bool,
+        score: float,
+        message: str,
+    ) -> None:
+        sql = """
+        INSERT INTO strategy_signals(
+          symbol,
+          interval,
+          close_time,
+          strategy_name,
+          strategy_type,
+          active,
+          score,
+          message
+        )
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
+        """
+        with self._conn() as conn, conn.cursor() as cur:
+            cur.execute(
+                sql,
+                (
+                    symbol,
+                    interval,
+                    close_time,
+                    strategy_name,
+                    strategy_type,
+                    active,
+                    score,
+                    message,
+                ),
+            )
 

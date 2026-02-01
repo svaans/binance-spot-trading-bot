@@ -21,6 +21,8 @@ class StrategyResult:
     name: str
     active: bool
     message: str
+    score: float
+    tipo: str
 
 
 class StrategyEngine:
@@ -60,7 +62,12 @@ class StrategyEngine:
         df: pd.DataFrame,
         indicators: Optional[Dict[str, Any]] = None,
     ) -> List[StrategyResult]:
-        return self._evaluate(self.entry_strategies, df=df, indicators=indicators)
+        return self._evaluate(
+            self.entry_strategies,
+            df=df,
+            indicators=indicators,
+            tipo="entrada",
+        )
 
     def evaluate_exits(
         self,
@@ -68,7 +75,12 @@ class StrategyEngine:
         df: pd.DataFrame,
         indicators: Optional[Dict[str, Any]] = None,
     ) -> List[StrategyResult]:
-        return self._evaluate(self.exit_strategies, df=df, indicators=indicators)
+        return self._evaluate(
+            self.exit_strategies,
+            df=df,
+            indicators=indicators,
+            tipo="salida",
+        )
 
     def _evaluate(
         self,
@@ -76,13 +88,22 @@ class StrategyEngine:
         *,
         df: pd.DataFrame,
         indicators: Optional[Dict[str, Any]],
+        tipo: str,
     ) -> List[StrategyResult]:
         resultados: List[StrategyResult] = []
         for name, func in strategies.items():
-            result = self._run_strategy(func, df=df, indicators=indicators)
+            result = self._run_strategy(func, df=df, indicators=indicators, tipo=tipo)
             if result is None:
                 continue
-            resultados.append(StrategyResult(name=name, active=result["activo"], message=result["mensaje"]))
+            resultados.append(
+                StrategyResult(
+                    name=name,
+                    active=result["activo"],
+                    message=result["mensaje"],
+                    score=result["score"],
+                    tipo=result["tipo"],
+                )
+            )
         return resultados
 
     def _run_strategy(
@@ -91,6 +112,7 @@ class StrategyEngine:
         *,
         df: pd.DataFrame,
         indicators: Optional[Dict[str, Any]],
+        tipo: str,
     ) -> Optional[Dict[str, Any]]:
         try:
             payload = self._build_call_payload(func, df=df, indicators=indicators)
@@ -99,11 +121,63 @@ class StrategyEngine:
             log.warning("Estrategia %s falló: %s", getattr(func, "__name__", func), exc)
             return None
 
-        if isinstance(response, dict) and "activo" in response:
-            mensaje = response.get("mensaje", "")
-            return {"activo": bool(response["activo"]), "mensaje": mensaje}
+        if isinstance(response, dict):
+            return self._normalize_response(response, func=func, tipo=tipo)
 
         return None
+    
+    def _normalize_response(
+        self,
+        response: Dict[str, Any],
+        *,
+        func: Callable[..., Any],
+        tipo: str,
+    ) -> Optional[Dict[str, Any]]:
+        if "activo" not in response:
+            log.warning("Estrategia %s sin campo 'activo'", getattr(func, "__name__", func))
+            return None
+
+        mensaje = response.get("mensaje", "")
+        if not isinstance(mensaje, str):
+            mensaje = str(mensaje)
+
+        score = response.get("score", 0.0)
+        try:
+            score_value = float(score)
+        except (TypeError, ValueError):
+            log.warning("Estrategia %s score inválido: %s", getattr(func, "__name__", func), score)
+            score_value = 0.0
+
+        tipo_value = response.get("tipo", tipo)
+        if not isinstance(tipo_value, str) or not tipo_value.strip():
+            log.warning("Estrategia %s tipo inválido: %s", getattr(func, "__name__", func), tipo_value)
+            tipo_value = tipo
+
+        return {
+            "activo": bool(response["activo"]),
+            "mensaje": mensaje,
+            "score": score_value,
+            "tipo": tipo_value.lower().strip(),
+        }
+
+    @staticmethod
+    def select_signals(
+        results: Iterable[StrategyResult],
+        *,
+        min_active: int = 1,
+        min_score: float = 0.0,
+    ) -> List[StrategyResult]:
+        active = [res for res in results if res.active]
+        if min_score > 0:
+            active = [res for res in active if res.score >= min_score]
+
+        if min_active <= 0:
+            return active
+
+        if len(active) >= min_active:
+            return active
+
+        return []
 
     def _build_call_payload(
         self,

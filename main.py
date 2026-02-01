@@ -42,6 +42,8 @@ SL_PCT = float(os.getenv("SL_PCT", "0.01"))
 MAX_CANDLES = int(os.getenv("MAX_CANDLES", "200"))
 EXECUTE_ORDERS = os.getenv("EXECUTE_ORDERS", "false").strip().lower() == "true"
 TAAPI_ENABLED = os.getenv("TAAPI_ENABLED", "true").strip().lower() == "true"
+STRATEGY_MIN_ACTIVE = int(os.getenv("STRATEGY_MIN_ACTIVE", "1"))
+STRATEGY_MIN_SCORE = float(os.getenv("STRATEGY_MIN_SCORE", "0"))
 
 if not SYMBOLS:
     raise RuntimeError("No hay SYMBOLS definidos en claves.env")
@@ -133,7 +135,30 @@ def _log_strategy_hits(symbol: str, results: list[StrategyResult], kind: str) ->
     if not activas:
         return
     for res in activas:
-        log.info("[%s] %s -> %s", kind, symbol, res.message)
+        log.info("[%s] %s | %s (score=%.2f) -> %s", kind, symbol, res.name, res.score, res.message)
+
+
+def _persist_strategy_signals(
+    *,
+    symbol: str,
+    interval: str,
+    close_time: int,
+    results: list[StrategyResult],
+) -> None:
+    for res in results:
+        try:
+            db.log_strategy_signal(
+                symbol=symbol,
+                interval=interval,
+                close_time=close_time,
+                strategy_name=res.name,
+                strategy_type=res.tipo,
+                active=res.active,
+                score=res.score,
+                message=res.message,
+            )
+        except Exception as exc:
+            log.warning("No se pudo registrar señal %s: %s", res.name, exc)
 
 def on_kline(event: KlineEvent) -> None:
     # Solo velas cerradas (también se filtra en websocket.py, pero reforzamos)
@@ -179,8 +204,19 @@ def on_kline(event: KlineEvent) -> None:
 
     if event.symbol not in positions:
         resultados = strategy_engine.evaluate_entries(df=df, indicators=indicators)
+        _persist_strategy_signals(
+            symbol=event.symbol,
+            interval=event.interval,
+            close_time=event.close_time,
+            results=resultados,
+        )
         _log_strategy_hits(event.symbol, resultados, "ENTRADA")
-        if any(res.active for res in resultados):
+        seleccionadas = StrategyEngine.select_signals(
+            resultados,
+            min_active=STRATEGY_MIN_ACTIVE,
+            min_score=STRATEGY_MIN_SCORE,
+        )
+        if seleccionadas:
             if EXECUTE_ORDERS:
                 budget = max(MIN_BUY_EUR, executor.compute_quote_budget(QUOTE_ASSET, RISK_PCT))
                 if budget <= 0:
@@ -197,8 +233,19 @@ def on_kline(event: KlineEvent) -> None:
         return
 
     resultados = strategy_engine.evaluate_exits(df=df, indicators=indicators)
+    _persist_strategy_signals(
+        symbol=event.symbol,
+        interval=event.interval,
+        close_time=event.close_time,
+        results=resultados,
+    )
     _log_strategy_hits(event.symbol, resultados, "SALIDA")
-    if any(res.active for res in resultados):
+    seleccionadas = StrategyEngine.select_signals(
+        resultados,
+        min_active=STRATEGY_MIN_ACTIVE,
+        min_score=STRATEGY_MIN_SCORE,
+    )
+    if seleccionadas:
         if EXECUTE_ORDERS:
             base_asset = positions[event.symbol].base_asset
             base_qty = executor.get_free_balance(base_asset)
@@ -224,6 +271,11 @@ async def run_bot() -> None:
     log.info("Modo órdenes: %s", "ACTIVO" if EXECUTE_ORDERS else "SOLO DATOS")
     log.info("Riesgo: %.2f%% | MIN_BUY_EUR: %.2f | TP: %.2f%% | SL: %.2f%%",
              RISK_PCT * 100, MIN_BUY_EUR, TP_PCT * 100, SL_PCT * 100)
+    log.info(
+        "Selector estrategias: min_activas=%d | score_min=%.2f",
+        STRATEGY_MIN_ACTIVE,
+        STRATEGY_MIN_SCORE,
+    )
 
     ws = BinanceWebSocket(symbols=SYMBOLS, interval=TIMEFRAME, on_kline=on_kline)
 
