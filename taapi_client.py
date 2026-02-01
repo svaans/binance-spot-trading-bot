@@ -1,6 +1,7 @@
 import logging
 import os
-from typing import Any, Dict, List
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Set
 
 import requests
 
@@ -96,15 +97,49 @@ class TAAPIClient:
                 indicators[item_id] = item
         return indicators
 
+    def _expected_indicator_ids(self) -> Set[str]:
+        return {
+            "ema_9",
+            "ema_20",
+            "ema_50",
+            "ema_100",
+            "ema_200",
+            "sma_20",
+            "sma_50",
+            "sma_200",
+            "macd",
+            "adx",
+            "ichimoku",
+            "psar",
+            "rsi",
+            "stoch",
+            "stochrsi",
+            "cci",
+            "willr",
+            "roc",
+            "momentum",
+            "atr",
+            "bbands",
+            "keltner",
+            "donchian",
+            "obv",
+            "mfi",
+            "vwap",
+            "pivotpoints",
+        }
+
     def fetch_snapshot(self, *, symbol: str, interval: str, close_time: int) -> Dict[str, Any]:
         cached = self.db.get_indicators_snapshot(symbol=symbol, interval=interval, close_time=close_time)
         if cached:
             normalized = self._normalize_response(cached)
+            expected_ids = self._expected_indicator_ids()
+            missing_ids = sorted(expected_ids - set(normalized.keys()))
             return {
                 "symbol": symbol,
                 "interval": interval,
                 "close_time": close_time,
                 "indicators": normalized,
+                "missing_indicators": missing_ids,
                 "source": "cache",
             }
 
@@ -136,6 +171,9 @@ class TAAPIClient:
         if "data" not in payload_json:
             raise RuntimeError("Respuesta inválida de TAAPI (sin data)")
 
+        call_date = datetime.now(timezone.utc).date().isoformat()
+        self.db.increment_taapi_call(call_date=call_date)
+
         self.db.insert_indicators_snapshot(
             symbol=symbol,
             interval=interval,
@@ -144,10 +182,13 @@ class TAAPIClient:
         )
 
         normalized = self._normalize_response(payload_json)
+        expected_ids = self._expected_indicator_ids()
+        missing_ids = sorted(expected_ids - set(normalized.keys()))
         return {
             "symbol": symbol,
             "interval": interval,
             "close_time": close_time,
             "indicators": normalized,
+            "missing_indicators": missing_ids,
             "source": "taapi",
         }

@@ -74,6 +74,12 @@ class DB:
 
         CREATE UNIQUE INDEX IF NOT EXISTS uq_indicators_snapshot_symbol_interval_close
         ON indicators_snapshot(symbol, interval, close_time);
+
+        CREATE TABLE IF NOT EXISTS taapi_call_log (
+          call_date DATE PRIMARY KEY,
+          calls_count INTEGER NOT NULL DEFAULT 0,
+          updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        );
         """
         with self._conn() as conn, conn.cursor() as cur:
             cur.execute(ddl)
@@ -151,4 +157,24 @@ class DB:
         """
         with self._conn() as conn, conn.cursor() as cur:
             cur.execute(sql, (symbol, interval, close_time, json.dumps(payload_json)))
+
+    def increment_taapi_call(self, *, call_date: str) -> None:
+        sql = """
+        INSERT INTO taapi_call_log(call_date, calls_count)
+        VALUES (%s, 1)
+        ON CONFLICT (call_date) DO UPDATE
+          SET calls_count = taapi_call_log.calls_count + 1,
+              updated_at = NOW()
+        """
+        with self._conn() as conn, conn.cursor() as cur:
+            cur.execute(sql, (call_date,))
+
+    def get_taapi_calls_for_date(self, *, call_date: str) -> int:
+        sql = "SELECT calls_count FROM taapi_call_log WHERE call_date=%s"
+        with self._conn() as conn, conn.cursor() as cur:
+            cur.execute(sql, (call_date,))
+            row = cur.fetchone()
+            if not row:
+                return 0
+            return int(row[0])
 
