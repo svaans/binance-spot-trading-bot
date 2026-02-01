@@ -1,0 +1,16 @@
+# Entornos
+venv/
+__pycache__/
+*.pyc
+
+# Variables de entorno / secretos
+.env
+*.env
+claves.env
+
+# Logs
+*.log
+
+# SO
+.DS_Store
+Thumbs.db
