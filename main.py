@@ -127,57 +127,9 @@ def on_kline(event: KlineEvent) -> None:
         event.open, event.high, event.low, event.close, event.volume
     )
 
-    action = decide_action(event)
-    if action == "HOLD":
-        return
-
-    sym = event.symbol
-    base_asset = base_asset_from_symbol(sym)
-
-    try:
-        if action == "BUY":
-            # 1 posición por símbolo
-            if sym in positions:
-                return
-
-            budget = executor.compute_quote_budget(QUOTE_ASSET, RISK_PCT)
-            if budget < MIN_BUY_EUR:
-                log.warning("Budget %.2f EUR < MIN_BUY_EUR %.2f. No compro %s.", budget, MIN_BUY_EUR, sym)
-                return
-
-            res = executor.place_market_buy_by_quote(sym, budget)
-            log.info("BUY OK %s | orderId=%s status=%s", sym, res.order_id, res.status)
-
-            # Guardar posición en DB (para reinicios)
-            db.upsert_open_position(
-                symbol=sym,
-                base_asset=base_asset,
-                quote_asset=QUOTE_ASSET,
-                entry_price=event.close,
-            )
-            positions[sym] = Position(symbol=sym, base_asset=base_asset, entry_price=event.close)
-            log.info("POS OPEN %s | entry=%.6f", sym, event.close)
-
-        elif action == "SELL":
-            # Solo si hay posición abierta
-            if sym not in positions:
-                return
-
-            # ✅ VENTA ROBUSTA: balance real + stepSize + MIN_NOTIONAL
-            free_base = executor.get_free_balance(base_asset)
-            if free_base <= 0:
-                log.warning("Balance %s=0, no puedo vender %s.", base_asset, sym)
-                return
-
-            res = executor.place_market_sell_by_base_safe(sym, free_base)
-            log.info("SELL OK %s | orderId=%s status=%s", sym, res.order_id, res.status)
-
-            db.close_position(symbol=sym)
-            del positions[sym]
-            log.info("POS CLOSED %s", sym)
-
-    except Exception as e:
-        log.exception("Fallo ejecutando %s en %s: %s", action, sym, e)
+    # Nota: el main no ejecuta órdenes ni estrategias por ahora.
+    # La lógica de compra/venta se moverá a ordenes.py cuando se definan estrategias.
+    log.info("Modo solo datos: no se ejecutan órdenes desde main.py.")
 
 
 async def run_bot() -> None:
@@ -186,6 +138,7 @@ async def run_bot() -> None:
     log.info("Iniciando BOT (EUR + PostgreSQL/Supabase)")
     log.info("Símbolos: %s", SYMBOLS)
     log.info("Timeframe: %s", TIMEFRAME)
+    log.info("Modo: SOLO DATOS (sin órdenes)")
     log.info("Riesgo: %.2f%% | MIN_BUY_EUR: %.2f | TP: %.2f%% | SL: %.2f%%",
              RISK_PCT * 100, MIN_BUY_EUR, TP_PCT * 100, SL_PCT * 100)
 
