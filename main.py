@@ -15,13 +15,15 @@ import logging
 import os
 import signal
 from dataclasses import dataclass
-from typing import Dict
+from typing import Dict, Optional
 
 from dotenv import load_dotenv
 
 from websocket import BinanceWebSocket, KlineEvent
 from db import DB
 from ordenes import BinanceSpotExecutor
+from strategy_engine import StrategyEngine, StrategyResult
+from taapi_client import TAAPIClient
 
 # -----------------------------
 # ENV
@@ -37,6 +39,9 @@ MIN_BUY_EUR = float(os.getenv("MIN_BUY_EUR", "10"))
 
 TP_PCT = float(os.getenv("TP_PCT", "0.01"))
 SL_PCT = float(os.getenv("SL_PCT", "0.01"))
+MAX_CANDLES = int(os.getenv("MAX_CANDLES", "200"))
+EXECUTE_ORDERS = os.getenv("EXECUTE_ORDERS", "false").strip().lower() == "true"
+TAAPI_ENABLED = os.getenv("TAAPI_ENABLED", "true").strip().lower() == "true"
 
 if not SYMBOLS:
     raise RuntimeError("No hay SYMBOLS definidos en claves.env")
@@ -68,6 +73,20 @@ db = DB()
 db.init_schema()
 
 executor = BinanceSpotExecutor(db=db)
+strategy_engine = StrategyEngine(
+    entry_dir="strategy_entry",
+    exit_dir="strategy_exit",
+    max_candles=MAX_CANDLES,
+)
+taapi_client: Optional[TAAPIClient]
+if TAAPI_ENABLED:
+    try:
+        taapi_client = TAAPIClient(db=db)
+    except RuntimeError as exc:
+        log.warning("TAAPI desactivado: %s", exc)
+        taapi_client = None
+else:
+    taapi_client = None
 
 
 def base_asset_from_symbol(symbol: str) -> str:
@@ -88,27 +107,33 @@ def load_positions_from_db() -> None:
     log.info("Posiciones OPEN recuperadas del DB: %s", list(positions.keys()))
 
 
-def decide_action(event: KlineEvent) -> str:
-    """
-    Estrategia DEMO:
-    - BUY si no hay posición y la vela cierra por encima de la apertura (vela verde).
-    - SELL si hay posición y llega a TP o SL según entry_price.
-    """
-    sym = event.symbol
+def open_position(symbol: str, entry_price: float) -> None:
+    base_asset = base_asset_from_symbol(symbol)
+    positions[symbol] = Position(
+        symbol=symbol,
+        base_asset=base_asset,
+        entry_price=entry_price,
+    )
+    db.upsert_open_position(
+        symbol=symbol,
+        base_asset=base_asset,
+        quote_asset=QUOTE_ASSET,
+        entry_price=entry_price,
+    )
 
-    if sym not in positions:
-        return "BUY" if event.close > event.open else "HOLD"
 
-    pos = positions[sym]
-    pnl_pct = (event.close - pos.entry_price) / pos.entry_price
+def close_position(symbol: str) -> None:
+    if symbol in positions:
+        positions.pop(symbol, None)
+    db.close_position(symbol=symbol)
 
-    if pnl_pct >= TP_PCT:
-        return "SELL"
-    if pnl_pct <= -SL_PCT:
-        return "SELL"
-
-    return "HOLD"
-
+    
+def _log_strategy_hits(symbol: str, results: list[StrategyResult], kind: str) -> None:
+    activas = [res for res in results if res.active]
+    if not activas:
+        return
+    for res in activas:
+        log.info("[%s] %s -> %s", kind, symbol, res.message)
 
 def on_kline(event: KlineEvent) -> None:
     # Solo velas cerradas (también se filtra en websocket.py, pero reforzamos)
@@ -127,9 +152,67 @@ def on_kline(event: KlineEvent) -> None:
         event.open, event.high, event.low, event.close, event.volume
     )
 
-    # Nota: el main no ejecuta órdenes ni estrategias por ahora.
-    # La lógica de compra/venta se moverá a ordenes.py cuando se definan estrategias.
-    log.info("Modo solo datos: no se ejecutan órdenes desde main.py.")
+    df = strategy_engine.update_candle(
+        symbol=event.symbol,
+        candle={
+            "open_time": event.open_time,
+            "close_time": event.close_time,
+            "open": event.open,
+            "high": event.high,
+            "low": event.low,
+            "close": event.close,
+            "volume": event.volume,
+        },
+    )
+
+    indicators = None
+    if taapi_client is not None:
+        try:
+            snapshot = taapi_client.fetch_snapshot(
+                symbol=event.symbol,
+                interval=event.interval,
+                close_time=event.close_time,
+            )
+            indicators = snapshot.get("indicators")
+        except Exception as exc:
+            log.warning("TAAPI error para %s: %s", event.symbol, exc)
+
+    if event.symbol not in positions:
+        resultados = strategy_engine.evaluate_entries(df=df, indicators=indicators)
+        _log_strategy_hits(event.symbol, resultados, "ENTRADA")
+        if any(res.active for res in resultados):
+            if EXECUTE_ORDERS:
+                budget = max(MIN_BUY_EUR, executor.compute_quote_budget(QUOTE_ASSET, RISK_PCT))
+                if budget <= 0:
+                    log.warning("Sin balance disponible para %s", QUOTE_ASSET)
+                    return
+                try:
+                    res = executor.place_market_buy_by_quote(event.symbol, budget)
+                    log.info("BUY ejecutado: %s %s", res.symbol, res.client_order_id)
+                    open_position(event.symbol, entry_price=event.close)
+                except Exception as exc:
+                    log.error("Error en BUY %s: %s", event.symbol, exc)
+            else:
+                log.info("Señal de entrada detectada (EXECUTE_ORDERS=false).")
+        return
+
+    resultados = strategy_engine.evaluate_exits(df=df, indicators=indicators)
+    _log_strategy_hits(event.symbol, resultados, "SALIDA")
+    if any(res.active for res in resultados):
+        if EXECUTE_ORDERS:
+            base_asset = positions[event.symbol].base_asset
+            base_qty = executor.get_free_balance(base_asset)
+            if base_qty <= 0:
+                log.warning("Sin balance de %s para vender", base_asset)
+                return
+            try:
+                res = executor.place_market_sell_by_base_safe(event.symbol, base_qty)
+                log.info("SELL ejecutado: %s %s", res.symbol, res.client_order_id)
+                close_position(event.symbol)
+            except Exception as exc:
+                log.error("Error en SELL %s: %s", event.symbol, exc)
+        else:
+            log.info("Señal de salida detectada (EXECUTE_ORDERS=false).")
 
 
 async def run_bot() -> None:
@@ -138,7 +221,7 @@ async def run_bot() -> None:
     log.info("Iniciando BOT (EUR + PostgreSQL/Supabase)")
     log.info("Símbolos: %s", SYMBOLS)
     log.info("Timeframe: %s", TIMEFRAME)
-    log.info("Modo: SOLO DATOS (sin órdenes)")
+    log.info("Modo órdenes: %s", "ACTIVO" if EXECUTE_ORDERS else "SOLO DATOS")
     log.info("Riesgo: %.2f%% | MIN_BUY_EUR: %.2f | TP: %.2f%% | SL: %.2f%%",
              RISK_PCT * 100, MIN_BUY_EUR, TP_PCT * 100, SL_PCT * 100)
 
